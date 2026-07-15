@@ -307,7 +307,11 @@ tr:hover td{background:#FAFAF8}
 .setup-btn:hover{background:#333}
 
 @media(max-width:600px){
-  .topbar{padding:12px 14px 4px}.content{padding:12px 14px}.summary{padding:12px 14px 4px;grid-template-columns:1fr 1fr;gap:10px}.tabs{padding:4px 14px 0}.actions{padding:12px 14px}
+  .topbar{padding:12px 14px 4px}.content{padding:12px 14px}.summary{padding:12px 14px 4px;grid-template-columns:1fr 1fr;gap:10px}.tabs{padding:4px 14px 0}
+  /* Панель кнопок прибита к низу экрана, а внизу страницы резервируем место под неё,
+     иначе последние строки таблицы оказываются под панелью и их не заполнить */
+  .actions{padding:12px 14px;position:fixed;left:0;right:0;bottom:0;margin-top:0;box-shadow:0 -2px 12px rgba(0,0,0,.10);padding-bottom:calc(12px + env(safe-area-inset-bottom))}
+  body{padding-bottom:var(--action-h,160px)}
   th,td{padding:7px 7px;font-size:12px}.role-grid{grid-template-columns:1fr 1fr 1fr;gap:6px}.rc-icon{font-size:18px}.rc-title{font-size:12px}
   .twrap{overflow-x:auto}th{position:static}
   .brand-logo{height:38px}.brand-tag{font-size:22px}.scard-val{font-size:24px}.scard-ico{width:32px;height:32px}
@@ -543,7 +547,7 @@ tr:hover td{background:#FAFAF8}
   <div class="tbar-title">
     <img class="brand-logo" id="brand-logo" alt="BreadVenture">
     <span class="brand-tag">Инвентаризация</span>
-    <span style="font-size:11px;color:var(--text3);align-self:flex-end;margin-bottom:4px;opacity:.7">v22</span>
+    <span style="font-size:11px;color:var(--text3);align-self:flex-end;margin-bottom:4px;opacity:.7">v24</span>
   </div>
   <div class="tbar-meta">
     <div class="ml"><label>Дата</label><input type="date" class="mi" id="inv-date" style="width:130px"></div>
@@ -1325,6 +1329,12 @@ function buildPurchaseList() {
 // ==================== ПЛАН ЗАКУПКИ (менеджер/фаундер) ====================
 function planKey(cat, name){ return cat + '||' + name; }
 
+// Поставщик «по умолчанию» (первый привязанный к позиции) — то, что показано в строке, если не выбрано вручную
+function firstSupplierFor(name){
+  const m = suppliers.filter(sv => sv.items && sv.items.some(si => String(si).toLowerCase() === String(name).toLowerCase()));
+  return m.length ? m[0].name : '';
+}
+
 function buildPurchasePlan(lows, mids) {
   const wrap = document.getElementById('purchase-plan');
   if (!wrap) return;
@@ -1370,13 +1380,14 @@ function buildPurchasePlan(lows, mids) {
     <div class="ph" style="justify-content:space-between">
       <span>📋 План закупки <span class="pcnt" id="plan-cnt" style="background:var(--blue);color:#fff">0</span></span>
     </div>
-    <div style="font-size:12px;color:var(--text2);padding:6px 10px 10px">Отметь галочкой, что идёт в закупку, укажи поставщика, кол-во и комментарий. Затем подтверди — список уйдёт в Telegram (общий чат, тебе и менеджеру).</div>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:0 10px 12px">
-      <span style="font-size:12px;color:var(--text2)">🚚 Дата поставки сразу для поставщика:</span>
+    <div style="font-size:12px;color:var(--text2);padding:6px 10px 10px">Поставь галочки на позициях, которые идут в закупку, укажи кол-во, поставщика и комментарий. Затем подтверди — список уйдёт в Telegram (общий чат, тебе и менеджеру).</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:0 10px 4px">
+      <span style="font-size:12px;color:var(--text2)">🚚 Проставить дату поставки отмеченным позициям поставщика:</span>
       <select id="bulk-sup" style="flex:0 1 160px;min-width:130px">${bulkSupOpts}</select>
       <input type="date" id="bulk-date" style="font-size:12px">
-      <button class="btn btn-sm" onclick="applySupplierDelivery()">Применить ко всем</button>
+      <button class="btn btn-sm" onclick="applySupplierDelivery()">Применить</button>
     </div>
+    <div style="font-size:11px;color:var(--text3);padding:0 10px 12px">Галочки не меняет — ставит дату только тем позициям этого поставщика, что уже отмечены.</div>
     <div>${rows}</div>
     <div style="padding:12px 10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button class="btn btn-dark" onclick="confirmPurchasePlan()">✅ Подтвердить и отправить закупку</button>
@@ -1404,18 +1415,22 @@ function applySupplierDelivery(){
   const date = (document.getElementById('bulk-date')||{}).value || '';
   if (!sup) { alert('Выбери поставщика.'); return; }
   if (!date) { alert('Укажи дату поставки.'); return; }
-  let n = 0;
-  planItemsCache.forEach(({key, cat, name, supplier}) => {
-    if (supplier !== sup) return;
-    if (!purchasePlan[key]) purchasePlan[key] = {checked:false, supplier:'', qty:'', comment:'', delivery:''};
-    purchasePlan[key].supplier = sup;
-    purchasePlan[key].delivery = date;
-    purchasePlan[key].checked = true; // дата поставки = позиция идёт в закупку
+  let n = 0, skipped = 0;
+  planItemsCache.forEach(({key, supplier}) => {
+    if (supplier !== sup) return;          // только позиции этого поставщика
+    const p = purchasePlan[key];
+    if (!p || !p.checked) { skipped++; return; } // НЕ трогаем галочки — работаем только с отмеченными
+    p.supplier = sup;                       // закрепляем поставщика (чтобы не ушло «без поставщика»)
+    p.delivery = date;                      // проставляем дату
     n++;
   });
+  if (n === 0) {
+    setSyncPill('err','У поставщика «'+sup+'» нет отмеченных позиций. Сначала поставь галочки, затем «Применить».');
+    return;
+  }
   savePurchasePlan();
   buildPurchaseList();
-  setSyncPill('ok','✓ Дата поставки проставлена: ' + n + ' поз.');
+  setSyncPill('ok','✓ Дата '+date+' проставлена отмеченным позициям «'+sup+'»: '+n+' шт'+(skipped?(' · без галочки пропущено: '+skipped):''));
 }
 
 function clearPurchasePlan(){
@@ -1457,7 +1472,9 @@ async function confirmPurchasePlan(){
       if (!p || !p.checked) return;
       const s = state[cat]&&state[cat][i]?state[cat][i]:{};
       const unit = s.unit || it.unit;
-      out.push({ name: it.name, cat, qty: (p.qty===''||p.qty===undefined)?'' : p.qty, unit, supplier: p.supplier||'', comment: p.comment||'', delivery: p.delivery||'' });
+      const supplier = (p.supplier && String(p.supplier).trim()) ? p.supplier : firstSupplierFor(it.name);
+      const qty = (p.qty!==''&&p.qty!==undefined&&p.qty!==null) ? p.qty : (needToBuy(cat,i,s.val)||'');
+      out.push({ name: it.name, cat, qty: qty, unit, supplier: supplier, comment: p.comment||'', delivery: p.delivery||'' });
     });
   });
   if (!out.length) { alert('Отметь галочкой хотя бы одну позицию для закупки.'); return; }
@@ -2609,6 +2626,17 @@ function buildPurchaseBySupplier(lows, mids) {
 }
 
 // ==================== COMPLETION ====================
+// Резервируем внизу страницы место под панель кнопок (на телефоне она прибита к низу),
+// иначе последние строки таблицы прячутся под ней. Высота зависит от роли — меряем фактическую.
+function adjustActionBarSpace() {
+  try {
+    const bar = document.getElementById('action-bar');
+    if (!bar) return;
+    const h = bar.offsetHeight || 0;
+    document.documentElement.style.setProperty('--action-h', (h + 24) + 'px');
+  } catch(e) {}
+}
+
 function applyRoleUI() {
   const isManager = currentRole === 'manager';
   const isStaff = currentRole === 'baker' || currentRole === 'barista';
@@ -2620,7 +2648,14 @@ function applyRoleUI() {
   document.querySelectorAll('.staff-only').forEach(el => {
     el.style.display = isStaff ? 'flex' : 'none';
   });
+  // набор кнопок изменился — пересчитать место под панель
+  adjustActionBarSpace();
+  setTimeout(adjustActionBarSpace, 120);
 }
+
+window.addEventListener('resize', adjustActionBarSpace);
+window.addEventListener('orientationchange', () => setTimeout(adjustActionBarSpace, 200));
+window.addEventListener('load', () => setTimeout(adjustActionBarSpace, 200));
 
 function getCatFillStatus() {
   const cats = ROLE_CATS[currentRole] || [];
