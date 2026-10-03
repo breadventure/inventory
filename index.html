@@ -1714,13 +1714,19 @@ async function openSnapshot(id, who, date) {
     const r = await fetch(SCRIPT_URL + '?action=snapshot&id=' + encodeURIComponent(id));
     const d = await r.json();
     if (d.status === 'ok' && d.items && d.items.length) {
+      snapshotCache[id] = d;
       // группируем по категориям
       const byCat = {};
       d.items.forEach(it => { if(!byCat[it.cat]) byCat[it.cat]=[]; byCat[it.cat].push(it); });
       const stColor = s => (s==='Мало'||s==='Ноль на складе')?'var(--red)':s==='Среднее'?'var(--amber)':s==='Норма'?'var(--green)':'var(--text3)';
-      let html = `<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+      const idJs = String(id).replace(/'/g,"\\'");
+      let html = `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap">
         <button class="btn btn-sm" onclick="openHistory()">‹ К истории</button>
         <div style="font-size:13px;color:var(--text2)">${who||''} · ${date||''}</div>
+        <button class="btn btn-dark" style="margin-left:auto" onclick="applySnapshotToForm('${idJs}')">↓ Подставить в форму</button>
+      </div>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:14px;line-height:1.5">
+        Значения встанут в поля «Сейчас», но в Sheets ничего не запишется, пока вы не нажмёте «Сохранить в Sheets».
       </div>`;
       Object.keys(byCat).forEach(cat => {
         html += `<div style="font-size:13px;font-weight:500;margin:12px 0 6px">${cat}</div>
@@ -2224,6 +2230,66 @@ async function syncSuppliersToSheets() {
     setSyncPill('ok','✓ Поставщики сохранены');
   } catch(e) {
     setSyncPill('err','⚠ Нет связи — поставщики не сохранились');
+  }
+}
+
+// Подстановка снимка из истории в форму.
+// Пишем только в state на странице — Sheets не трогаем, пока менеджер
+// сам не нажмёт «Сохранить в Sheets». Так восстановление обратимо:
+// если подставилось не то, достаточно перезагрузить страницу.
+let snapshotCache = {};
+
+async function applySnapshotToForm(id) {
+  let d = snapshotCache[id];
+  if (!d) {
+    try {
+      const r = await fetch(SCRIPT_URL + '?action=snapshot&id=' + encodeURIComponent(id));
+      d = await r.json();
+      if (d.status === 'ok') snapshotCache[id] = d;
+    } catch(e) {}
+  }
+  if (!d || d.status !== 'ok' || !d.items || !d.items.length) {
+    alert('Не удалось получить данные этой инвентаризации.');
+    return;
+  }
+
+  const cats = ROLE_CATS[currentRole] || [];
+  if (!confirm('Подставить остатки от ' + (d.date||'') + ' (' + (d.who||'') + ') в форму?\n\n' +
+               'Текущие значения в полях «Сейчас» будут заменены. В Sheets пока ничего не запишется.')) return;
+
+  let applied = 0, skipped = [];
+  d.items.forEach(item => {
+    const cat = normalizeCat(item.cat);
+    if (!items[cat]) { skipped.push(item.name); return; }
+    // Позиция ищется по названию: если её с тех пор переименовали
+    // или удалили из списков, подставлять некуда — такие считаем отдельно.
+    const idx = items[cat].findIndex(it => it.name === item.name);
+    if (idx < 0) { skipped.push(item.name); return; }
+    if (!state[cat]) state[cat] = {};
+    if (!state[cat][idx]) state[cat][idx] = {};
+    state[cat][idx].val = item.val;
+    if (item.unit) state[cat][idx].unit = item.unit;
+    if (!state[cat][idx].note && item.note) state[cat][idx].note = item.note;
+    const hadVal = (item.val !== '' && item.val !== null && item.val !== undefined);
+    // Подставленное — это не свежий пересчёт, помечаем как значение из прошлого,
+    // чтобы в таблице оно было серым и его было видно глазами.
+    state[cat][idx].fromPrev = hadVal;
+    if (hadVal) { state[cat][idx].everFilled = true; applied++; }
+  });
+
+  prevDate = d.date || '';
+  cats.forEach(c => renderTable(c));
+  updateSummary(); buildPurchaseList();
+  if (typeof updateProgress === 'function') updateProgress();
+  try { localStorage.setItem('bv_state_backup', JSON.stringify({state, date: d.date, who: d.who, wish: ''})); } catch(e) {}
+
+  closeModal('hist-modal');
+  setSyncPill('', 'Подставлено ' + applied + ' поз. — не сохранено');
+
+  if (skipped.length) {
+    alert('Подставлено позиций: ' + applied + '.\n\nНе нашлось в текущих списках (' + skipped.length + '): ' +
+          skipped.slice(0, 12).join(', ') + (skipped.length > 12 ? '…' : '') +
+          '\n\nСкорее всего их переименовали или удалили во вкладке «Списки».');
   }
 }
 
