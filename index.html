@@ -773,6 +773,17 @@ let prevDate = ''; // дата прошлой инвентаризации (дл
 // Пины хранятся ТОЛЬКО в Apps Script (appsscript.gs), не здесь.
 
 let pinBuffer = '';
+// Пин текущего менеджера — нужен бэкенду для getTeam/setTeam/restore.
+// Держим в sessionStorage: переживает F5, но не остаётся на планшете после закрытия.
+let currentPin = sessionStorage.getItem('bv_pin') || '';
+// Идентификатор устройства: блокировка за неверные пины теперь не глобальная
+let deviceId = (function(){
+  try {
+    let d = localStorage.getItem('bv_sid');
+    if (!d) { d = 'd' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); localStorage.setItem('bv_sid', d); }
+    return d;
+  } catch(e) { return 'nosid'; }
+})();
 
 function pinKey(d) {
   if (pinBuffer.length >= 4) return;
@@ -807,12 +818,15 @@ async function doLogin() {
   document.getElementById('pin-error').textContent = '...';
 
   try {
-    const r = await fetch(SCRIPT_URL + '?action=checkPin&pin=' + encodeURIComponent(pinBuffer));
+    const r = await fetch(SCRIPT_URL + '?action=checkPin&pin=' + encodeURIComponent(pinBuffer)
+      + '&sid=' + encodeURIComponent(deviceId));
     const d = await r.json();
 
     if (d.role && d.name) {
       currentRole = d.role;
       currentName = d.name;
+      currentPin = pinBuffer;
+      try { sessionStorage.setItem('bv_pin', currentPin); } catch(e) {}
       localStorage.setItem('bv_role', d.role);
       localStorage.setItem('bv_name', d.name);
       document.getElementById('login-overlay').style.display = 'none';
@@ -904,6 +918,10 @@ function buildTabs(cats) {
     s.className = 'tab'; s.textContent = '🏪 Поставщики'; s.dataset.tab = '__suppliers';
     s.onclick = () => setActiveTab('__suppliers');
     row.appendChild(s);
+    const t = document.createElement('button');
+    t.className = 'tab'; t.textContent = '👥 Команда'; t.dataset.tab = '__team';
+    t.onclick = () => setActiveTab('__team');
+    row.appendChild(t);
   }
 }
 
@@ -924,6 +942,10 @@ function buildSections(cats) {
     ss2.id = 'sec-__suppliers'; ss2.className = 'content'; ss2.style.display = 'none';
     ss2.innerHTML = '<div id="sup-content"></div>';
     wrap.appendChild(ss2);
+    const ts = document.createElement('div');
+    ts.id = 'sec-__team'; ts.className = 'content'; ts.style.display = 'none';
+    ts.innerHTML = '<div id="team-content"></div>';
+    wrap.appendChild(ts);
   }
 
   // Purchase section
@@ -1539,9 +1561,10 @@ function setActiveTab(cat) {
   const sec = document.getElementById('sec-'+slugCat(cat));
   if (sec) {
     sec.style.display='';
-    if(cat!=='__purchase'&&cat!=='__editor'&&cat!=='__suppliers') renderTable(cat);
+    if(cat!=='__purchase'&&cat!=='__editor'&&cat!=='__suppliers'&&cat!=='__team') renderTable(cat);
     if(cat==='__editor') renderEditorTable();
     if(cat==='__suppliers') renderSuppliers();
+    if(cat==='__team') loadTeam();
   }
   if (typeof setTheadOffset === 'function') setTheadOffset();
 }
@@ -2033,7 +2056,7 @@ async function restoreFromLog() {
   if (!confirm('Подтянуть последние введённые остатки из истории по всем категориям? «Текущие остатки» будут заменены данными из истории.')) return;
   setSyncPill('busy','↻ Восстанавливаю из истории...');
   try {
-    const r = await fetch(SCRIPT_URL + '?action=restoreFromLog');
+    const r = await fetch(SCRIPT_URL + '?action=restoreFromLog&pin=' + encodeURIComponent(currentPin));
     const d = await r.json();
     if (d.status === 'ok') {
       setSyncPill('ok','✓ Восстановлено позиций с числом: ' + (d.filled||0));
@@ -2201,6 +2224,161 @@ async function syncSuppliersToSheets() {
     setSyncPill('ok','✓ Поставщики сохранены');
   } catch(e) {
     setSyncPill('err','⚠ Нет связи — поставщики не сохранились');
+  }
+}
+
+// ==================== КОМАНДА (пины) ====================
+// Менеджер правит состав здесь, без правки кода и редеплоя.
+// Бэкенд хранит пины в листе «Команда» и проверяет права по присланному пину.
+let teamDraft = null;
+
+const TEAM_ROLE_LABELS = {baker:'Пекарь', barista:'Бариста', manager:'Менеджер'};
+
+async function loadTeam() {
+  const wrap = document.getElementById('team-content');
+  if (!wrap) return;
+  if (currentRole !== 'manager') { wrap.innerHTML = ''; return; }
+  if (!SCRIPT_URL) { wrap.innerHTML = '<div class="hist-empty">Sheets не подключён</div>'; return; }
+  if (!currentPin) {
+    wrap.innerHTML = '<div class="hist-empty">Нужно войти по пину заново, чтобы управлять командой.' +
+      '<br><button class="btn btn-sm" style="margin-top:10px" onclick="location.reload()">Выйти и войти</button></div>';
+    return;
+  }
+  wrap.innerHTML = '<div class="hist-empty">Загрузка...</div>';
+  try {
+    const r = await fetch(SCRIPT_URL + '?action=getTeam&pin=' + encodeURIComponent(currentPin));
+    const d = await r.json();
+    if (d.status === 'forbidden') {
+      wrap.innerHTML = '<div class="hist-empty">' + (d.message || 'Нет доступа') + '</div>';
+      return;
+    }
+    if (d.status !== 'ok') {
+      wrap.innerHTML = '<div class="hist-empty">Не удалось загрузить команду</div>';
+      return;
+    }
+    teamDraft = (d.team || []).map(t => ({pin:t.pin, name:t.name, role:t.role, active:t.active !== false}));
+    renderTeam();
+  } catch(e) {
+    wrap.innerHTML = '<div class="hist-empty">Нет связи с Sheets</div>';
+  }
+}
+
+function renderTeam() {
+  const wrap = document.getElementById('team-content');
+  if (!wrap || !teamDraft) return;
+  const rolesOpts = ['baker','barista','manager'];
+
+  let html = '<div style="font-size:12px;color:var(--text2);margin-bottom:12px;line-height:1.5">' +
+    'Пин — 4 цифры, у каждого свой. Сняв галочку «Активен», вы закрываете вход, но сохраняете человека в истории. ' +
+    'Свой собственный пин отключить нельзя, и хотя бы один активный менеджер должен остаться.' +
+    '</div>';
+
+  html += '<div class="twrap"><table style="font-size:13px"><thead><tr>' +
+    '<th style="text-align:left">Имя</th><th>Пин</th><th>Роль</th><th>Активен</th><th></th>' +
+    '</tr></thead><tbody>';
+
+  teamDraft.forEach((t, i) => {
+    const isMe = t.pin === currentPin;
+    html += '<tr>' +
+      '<td><input class="sup-form-input" style="width:140px" value="' + escAttr(t.name) + '" oninput="teamEdit(' + i + ',\'name\',this.value)"></td>' +
+      '<td style="text-align:center"><input class="ed-num" inputmode="numeric" maxlength="4" style="width:70px;text-align:center;font-variant-numeric:tabular-nums" value="' + escAttr(t.pin) + '" oninput="teamEdit(' + i + ',\'pin\',this.value.replace(/\\D/g,\'\').slice(0,4))"></td>' +
+      '<td style="text-align:center"><select class="sup-form-select" style="width:110px" onchange="teamEdit(' + i + ',\'role\',this.value)">' +
+        rolesOpts.map(r => '<option value="' + r + '"' + (t.role === r ? ' selected' : '') + '>' + TEAM_ROLE_LABELS[r] + '</option>').join('') +
+      '</select></td>' +
+      '<td style="text-align:center"><input type="checkbox"' + (t.active ? ' checked' : '') +
+        (isMe ? ' disabled title="Свой пин отключить нельзя"' : '') +
+        ' onchange="teamEdit(' + i + ',\'active\',this.checked)"></td>' +
+      '<td style="text-align:center">' +
+        (isMe ? '<span style="font-size:11px;color:var(--text3)">это вы</span>'
+              : '<button class="btn btn-sm" onclick="teamRemove(' + i + ')">Удалить</button>') +
+      '</td></tr>';
+  });
+
+  html += '</tbody></table></div>';
+  html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center">' +
+    '<button class="btn btn-sm" onclick="teamAdd()">+ Добавить сотрудника</button>' +
+    '<button class="btn" onclick="saveTeam()">Сохранить команду</button>' +
+    '<button class="btn btn-sm" onclick="loadTeam()">Отменить изменения</button>' +
+    '<span id="team-msg" style="font-size:12px;color:var(--text2)"></span>' +
+    '</div>';
+
+  wrap.innerHTML = html;
+}
+
+function escAttr(v) {
+  return String(v == null ? '' : v).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+}
+
+function teamEdit(i, field, value) {
+  if (!teamDraft || !teamDraft[i]) return;
+  teamDraft[i][field] = value;
+  teamMsg('');
+}
+
+function teamAdd() {
+  if (!teamDraft) return;
+  // Предлагаем свободный 4-значный пин, чтобы не угадывать вручную
+  let pin = '';
+  for (let tries = 0; tries < 200; tries++) {
+    const c = String(Math.floor(1000 + Math.random() * 9000));
+    if (!teamDraft.some(t => t.pin === c)) { pin = c; break; }
+  }
+  teamDraft.push({pin: pin, name: '', role: 'baker', active: true});
+  renderTeam();
+}
+
+function teamRemove(i) {
+  if (!teamDraft || !teamDraft[i]) return;
+  const t = teamDraft[i];
+  if (t.pin === currentPin) { teamMsg('Свой пин удалить нельзя.'); return; }
+  if (!confirm('Удалить ' + (t.name || 'сотрудника') + ' из списка? Вход по пину ' + t.pin + ' перестанет работать.')) return;
+  teamDraft.splice(i, 1);
+  renderTeam();
+}
+
+function teamMsg(txt, isErr) {
+  const el = document.getElementById('team-msg');
+  if (el) { el.textContent = txt || ''; el.style.color = isErr ? 'var(--red)' : 'var(--text2)'; }
+}
+
+async function saveTeam() {
+  if (currentRole !== 'manager' || !teamDraft) return;
+
+  // Локальная проверка — чтобы не ходить на сервер за очевидными ошибками
+  const seen = {};
+  for (const t of teamDraft) {
+    if (!/^\d{4}$/.test(String(t.pin || ''))) { teamMsg('Пин должен быть из 4 цифр: ' + (t.name || 'без имени'), true); return; }
+    if (seen[t.pin]) { teamMsg('Пин ' + t.pin + ' повторяется.', true); return; }
+    seen[t.pin] = true;
+    if (!String(t.name || '').trim()) { teamMsg('У пина ' + t.pin + ' не указано имя.', true); return; }
+  }
+  if (!teamDraft.some(t => t.role === 'manager' && t.active)) {
+    teamMsg('Нужен хотя бы один активный менеджер.', true); return;
+  }
+  if (!teamDraft.some(t => t.pin === currentPin && t.role === 'manager' && t.active)) {
+    teamMsg('Нельзя оставить себя без доступа менеджера.', true); return;
+  }
+
+  teamMsg('Сохраняю...');
+  setSyncPill('busy','👥 Сохраняю команду...');
+  try {
+    const r = await fetch(SCRIPT_URL, {
+      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body: 'action=setTeam&pin=' + encodeURIComponent(currentPin) +
+            '&data=' + encodeURIComponent(JSON.stringify(teamDraft))
+    });
+    const d = await r.json();
+    if (d.status === 'ok') {
+      teamMsg('Сохранено: ' + d.saved + ' чел.');
+      setSyncPill('ok','✓ Команда сохранена');
+      await loadTeam();
+    } else {
+      teamMsg(d.message || 'Не удалось сохранить', true);
+      setSyncPill('err','⚠ Команда не сохранена');
+    }
+  } catch(e) {
+    teamMsg('Нет связи — изменения не сохранены', true);
+    setSyncPill('err','⚠ Нет связи');
   }
 }
 
