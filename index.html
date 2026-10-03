@@ -760,7 +760,18 @@ function normalizeCat(c){ return CAT_RENAME[c] || c; }
 
 // ==================== STATE ====================
 const LS_URL = 'bv_script_url';
-let SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxUJaprZrsdNZnU4WrRpu0yj-8Hvqzuo7AWtcOWpgOlxcFJKPE8kSrwMMPmYTJdaugw/exec';
+const SCRIPT_URL_DEFAULT = 'https://script.google.com/macros/s/AKfycbxOUkiD9H4Mt8rYzDydZYV65WomENi7FdsSWERsHvYdB9JD_IInkBOfXv3qaVNs5h-n/exec';
+let SCRIPT_URL = SCRIPT_URL_DEFAULT;
+// На устройствах в localStorage лежит адрес старого развёртывания, и он
+// имеет приоритет над вшитым. Разово подменяем его на актуальный, иначе
+// планшет продолжит стучаться по мёртвому адресу.
+const URL_MIGRATION = 'v5-2026-10-03';
+try {
+  if (localStorage.getItem('bv_url_migration') !== URL_MIGRATION) {
+    localStorage.setItem(LS_URL, SCRIPT_URL_DEFAULT);
+    localStorage.setItem('bv_url_migration', URL_MIGRATION);
+  }
+} catch(e) {}
 let currentRole = null;
 let currentName = '';
 let items = JSON.parse(JSON.stringify(DEFAULT_ITEMS)); // deep copy
