@@ -820,7 +820,21 @@ async function doLogin() {
   try {
     const r = await fetch(SCRIPT_URL + '?action=checkPin&pin=' + encodeURIComponent(pinBuffer)
       + '&sid=' + encodeURIComponent(deviceId));
-    const d = await r.json();
+    // Apps Script при проблемах с развёртыванием отдаёт HTML, а не JSON.
+    // Разбираем вручную, чтобы в этом случае было видно причину, а не просто
+    // «Ошибка соединения».
+    const raw = await r.text();
+    let d;
+    try { d = JSON.parse(raw); }
+    catch (parseErr) {
+      console.error('checkPin: ответ не JSON', r.status, raw.slice(0, 500));
+      const looksLikeLogin = /accounts\.google\.com|Sign in|Войдите/i.test(raw);
+      document.getElementById('pin-error').textContent = looksLikeLogin
+        ? 'Скрипт требует вход в Google. В развёртывании поставь «Доступ: Все».'
+        : 'Скрипт ответил не JSON (HTTP ' + r.status + '). Проверь URL развёртывания.';
+      document.getElementById('pin-ok-btn').disabled = false;
+      return;
+    }
 
     if (d.role && d.name) {
       currentRole = d.role;
@@ -2070,7 +2084,9 @@ async function restoreFromLog() {
     } else if (d.status === 'empty') {
       setSyncPill('err','⚠ В истории нет данных для восстановления');
     } else {
-      setSyncPill('err','⚠ Не удалось восстановить');
+      // Показываем текст от бэкенда: без него «не удалось» ничего не объясняет
+      setSyncPill('err','⚠ ' + (d.message || 'Не удалось восстановить'));
+      console.error('restoreFromLog:', d);
     }
   } catch(e) {
     setSyncPill('err','⚠ Нет связи — восстановление не выполнено');
