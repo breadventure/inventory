@@ -811,6 +811,86 @@ function updatePinDots(state) {
 
 document.addEventListener('DOMContentLoaded', () => {});
 
+
+// ==================== ОБМЕН С APPS SCRIPT (JSONP) ====================
+// Прямой fetch к script.google.com с github.io блокируется браузером:
+// "Origin ... is not allowed by Access-Control-Allow-Origin, status 400".
+// Поэтому запросы идут в обход CORS:
+//   • чтение  — JSONP: тег <script>, на который CORS не распространяется;
+//   • запись  — скрытая форма в iframe (большой JSON в адрес не влезает),
+//               а результат забирается отдельным JSONP-запросом по reqId.
+let _jsonpSeq = 0;
+
+function jsonp(params, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (!SCRIPT_URL) { reject(new Error('Адрес скрипта не задан')); return; }
+    const cb = '__bvcb' + (++_jsonpSeq) + '_' + Date.now().toString(36);
+    const qs = Object.keys(params)
+      .filter(k => params[k] !== undefined && params[k] !== null)
+      .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))
+      .join('&');
+
+    const sc = document.createElement('script');
+    let done = false;
+    const cleanup = () => {
+      if (done) return; done = true;
+      try { delete window[cb]; } catch(e) { window[cb] = undefined; }
+      if (sc.parentNode) sc.parentNode.removeChild(sc);
+      clearTimeout(timer);
+    };
+    const timer = setTimeout(() => { cleanup(); reject(new Error('Таймаут запроса')); },
+                             timeoutMs || 25000);
+
+    window[cb] = data => { cleanup(); resolve(data); };
+    sc.onerror = () => { cleanup(); reject(new Error('Скрипт недоступен')); };
+    sc.src = SCRIPT_URL + '?' + qs + (qs ? '&' : '') + 'callback=' + cb;
+    document.head.appendChild(sc);
+  });
+}
+
+/** Запись: форма → скрытый iframe, затем опрос результата по reqId. */
+function apiPost(params, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (!SCRIPT_URL) { reject(new Error('Адрес скрипта не задан')); return; }
+    const rid = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const frameName = 'bvframe_' + rid;
+
+    const fr = document.createElement('iframe');
+    fr.name = frameName; fr.style.display = 'none';
+    document.body.appendChild(fr);
+
+    const form = document.createElement('form');
+    form.method = 'POST'; form.action = SCRIPT_URL; form.target = frameName;
+    form.style.display = 'none';
+    const all = Object.assign({}, params, {reqId: rid});
+    Object.keys(all).forEach(k => {
+      const inp = document.createElement('input');
+      inp.type = 'hidden'; inp.name = k; inp.value = all[k];
+      form.appendChild(inp);
+    });
+    document.body.appendChild(form);
+    form.submit();
+
+    const started = Date.now();
+    const limit = timeoutMs || 45000;
+    const tidy = () => {
+      if (form.parentNode) form.parentNode.removeChild(form);
+      if (fr.parentNode) fr.parentNode.removeChild(fr);
+    };
+
+    const poll = () => {
+      if (Date.now() - started > limit) { tidy(); reject(new Error('Таймаут записи')); return; }
+      jsonp({action: 'result', rid: rid}, 10000)
+        .then(d => {
+          if (d && d.status === 'done') { tidy(); resolve(d.result); }
+          else setTimeout(poll, 800);
+        })
+        .catch(() => setTimeout(poll, 1200));
+    };
+    setTimeout(poll, 1200);
+  });
+}
+
 async function doLogin() {
   if (pinBuffer.length !== 4) return;
 
@@ -818,23 +898,7 @@ async function doLogin() {
   document.getElementById('pin-error').textContent = '...';
 
   try {
-    const r = await fetch(SCRIPT_URL + '?action=checkPin&pin=' + encodeURIComponent(pinBuffer)
-      + '&sid=' + encodeURIComponent(deviceId));
-    // Apps Script при проблемах с развёртыванием отдаёт HTML, а не JSON.
-    // Разбираем вручную, чтобы в этом случае было видно причину, а не просто
-    // «Ошибка соединения».
-    const raw = await r.text();
-    let d;
-    try { d = JSON.parse(raw); }
-    catch (parseErr) {
-      console.error('checkPin: ответ не JSON', r.status, raw.slice(0, 500));
-      const looksLikeLogin = /accounts\.google\.com|Sign in|Войдите/i.test(raw);
-      document.getElementById('pin-error').textContent = looksLikeLogin
-        ? 'Скрипт требует вход в Google. В развёртывании поставь «Доступ: Все».'
-        : 'Скрипт ответил не JSON (HTTP ' + r.status + '). Проверь URL развёртывания.';
-      document.getElementById('pin-ok-btn').disabled = false;
-      return;
-    }
+    const d = await jsonp({action:'checkPin', pin: pinBuffer, sid: deviceId});
 
     if (d.role && d.name) {
       currentRole = d.role;
@@ -1253,11 +1317,7 @@ async function saveItemsToSheets() {
   // Save to localStorage immediately
   try { localStorage.setItem('bv_items_v1', JSON.stringify(items)); } catch(e) {}
   try {
-    const r = await fetch(SCRIPT_URL, {
-      method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'action=setItems&data='+encodeURIComponent(JSON.stringify(items))
-    }); const d = await r.json();
+    const d = await apiPost({action:'setItems', data: JSON.stringify(items)});
     if (d.status==='ok') {
       // нормы/крит редактируются в редакторе через override — сохраняем и их
       saveThreshLocal(); saveCritLocal();
@@ -1518,9 +1578,7 @@ async function confirmPurchasePlan(){
   setSyncPill('busy','📤 Отправляю закупку...');
   const payload = { date: (document.getElementById('inv-date')||{}).value || new Date().toISOString().split('T')[0], by: currentName||'', items: out };
   try {
-    const r = await fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'action=purchasePlan&data='+encodeURIComponent(JSON.stringify(payload)) });
-    const d = await r.json().catch(()=>({status:'ok'}));
+    const d = await apiPost({action:'purchasePlan', data: JSON.stringify(payload)});
     if (d.status === 'error') { setSyncPill('err','⚠ Не отправилось: '+(d.message||'')); return; }
     setSyncPill('ok','✓ Закупка отправлена в Telegram');
   } catch(e) {
@@ -1592,11 +1650,7 @@ async function saveToSheets() {
   setSyncPill('busy','💾 Сохраняю...');
   document.getElementById('btn-save').disabled = true;
   try {
-    const r=await fetch(SCRIPT_URL, {
-      method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'action=save&data='+encodeURIComponent(JSON.stringify(payload))
-    }); const d=await r.json();
+    const d = await apiPost({action:'save', data: JSON.stringify(payload)}, 60000);
     if(d.status==='ok') setSyncPill('ok','✓ Сохранено в Sheets');
     else setSyncPill('err','⚠ '+d.message);
   } catch(e) { setSyncPill('err','⚠ '+e.message); }
@@ -1609,11 +1663,7 @@ async function sendToTelegram() {
   setSyncPill('busy','✈️ Отправляю...');
   document.getElementById('btn-tg').disabled = true;
   try {
-    const r=await fetch(SCRIPT_URL, {
-      method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'action=telegram&data='+encodeURIComponent(JSON.stringify(payload))
-    }); const d=await r.json();
+    const d = await apiPost({action:'telegram', data: JSON.stringify(payload)});
     if(d.status==='ok') setSyncPill('ok','✓ Отправлено в Telegram');
     else setSyncPill('err','⚠ '+d.message);
   } catch(e) { setSyncPill('err','⚠ '+e.message); }
@@ -1633,8 +1683,7 @@ async function loadFromSheets() {
     await loadSettingsFromSheets();
     // 4. Грузим последние остатки
     let lastDate = '', lastWho = '', lastWish = '';
-    const r = await fetch(SCRIPT_URL + '?action=load');
-    const d = await r.json();
+    const d = await jsonp({action:'load'});
     if (d.status === 'ok' && d.items && d.items.length) {
       lastDate = d.date; lastWho = d.who; lastWish = d.wish;
       prevDate = d.date || '';
@@ -1697,7 +1746,7 @@ async function openHistory() {
   document.getElementById('hist-body').innerHTML = '<div class="hist-empty">Загрузка...</div>';
   if(!SCRIPT_URL) { document.getElementById('hist-body').innerHTML='<div class="hist-empty">Sheets не подключён</div>'; return; }
   try {
-    const r=await fetch(SCRIPT_URL+'?action=history'); const d=await r.json();
+    const d = await jsonp({action:'history'});
     if(d.status==='ok'&&d.rows&&d.rows.length) {
       const roleLabel={baker:'Пекарь',barista:'Бариста',manager:'Менеджер'};
       document.getElementById('hist-body').innerHTML =
@@ -1725,8 +1774,7 @@ async function openSnapshot(id, who, date) {
   const body = document.getElementById('hist-body');
   body.innerHTML = '<div class="hist-empty">Загрузка...</div>';
   try {
-    const r = await fetch(SCRIPT_URL + '?action=snapshot&id=' + encodeURIComponent(id));
-    const d = await r.json();
+    const d = await jsonp({action:'snapshot', id: id});
     if (d.status === 'ok' && d.items && d.items.length) {
       snapshotCache[id] = d;
       // группируем по категориям
@@ -1957,19 +2005,15 @@ async function syncSettingsToSheets() {
         if (state[cat][i] && state[cat][i].deferred) deferredMap[cat][i] = true;
       });
     });
-    await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'action=setSettings&data=' + encodeURIComponent(JSON.stringify({thresh, crit: critMap, notes: notesMap, deferred: deferredMap}))
-    });
+    await apiPost({action:'setSettings',
+      data: JSON.stringify({thresh, crit: critMap, notes: notesMap, deferred: deferredMap})});
   } catch(e) {}
 }
 
 async function loadCustomItemsFromSheets() {
   if (!SCRIPT_URL) return;
   try {
-    const r = await fetch(SCRIPT_URL + '?action=getItems');
-    const d = await r.json();
+    const d = await jsonp({action:'getItems'});
     if (d.status === 'ok' && d.items && Object.keys(d.items).length) {
       // Merge with default items - update existing categories
       Object.keys(d.items).forEach(cat => {
@@ -1986,8 +2030,7 @@ async function loadCustomItemsFromSheets() {
 async function loadSettingsFromSheets() {
   if (!SCRIPT_URL) return;
   try {
-    const r = await fetch(SCRIPT_URL + '?action=getSettings');
-    const d = await r.json();
+    const d = await jsonp({action:'getSettings'});
     if (d.status === 'ok') {
       // Load thresh
       if (d.thresh && Object.keys(d.thresh).length) {
@@ -2076,8 +2119,7 @@ async function restoreFromLog() {
   if (!confirm('Подтянуть последние введённые остатки из истории по всем категориям? «Текущие остатки» будут заменены данными из истории.')) return;
   setSyncPill('busy','↻ Восстанавливаю из истории...');
   try {
-    const r = await fetch(SCRIPT_URL + '?action=restoreFromLog&pin=' + encodeURIComponent(currentPin));
-    const d = await r.json();
+    const d = await jsonp({action:'restoreFromLog', pin: currentPin}, 60000);
     if (d.status === 'ok') {
       setSyncPill('ok','✓ Восстановлено позиций с числом: ' + (d.filled||0));
       await loadFromSheets();
@@ -2126,7 +2168,12 @@ async function testScript() {
   if(!url) return;
   const errEl=document.getElementById('setup-err'); errEl.style.display='none';
   try {
-    const r=await fetch(url+'?action=load'); const d=await r.json();
+    // Проверяем введённый адрес тем же JSONP-путём, что и остальная работа,
+    // иначе проверка проходила бы, а реальные запросы падали.
+    const prev = SCRIPT_URL; SCRIPT_URL = url;
+    let d;
+    try { d = await jsonp({action:'load'}, 15000); }
+    finally { SCRIPT_URL = prev; }
     if(d.status==='ok'||d.status==='empty') {
       SCRIPT_URL=url; localStorage.setItem(LS_URL,url);
       document.getElementById('setup-overlay').classList.remove('open');
@@ -2207,8 +2254,7 @@ function loadSuppliers() {
 
 async function loadSuppliersFromSheets() {
   try {
-    const r = await fetch(SCRIPT_URL + '?action=getSuppliers');
-    const d = await r.json();
+    const d = await jsonp({action:'getSuppliers'});
     // если пользователь уже правил поставщиков — не затираем его правки ответом сервера (гонка при загрузке)
     if (suppliersDirty) return;
     if (d.status === 'ok' && d.suppliers && d.suppliers.length) {
@@ -2235,12 +2281,7 @@ function saveSuppliers() {
 async function syncSuppliersToSheets() {
   setSyncPill('busy','💾 Сохраняю поставщиков...');
   try {
-    const r = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'action=setSuppliers&data=' + encodeURIComponent(JSON.stringify(suppliers))
-    });
-    const d = await r.json().catch(() => ({status:'ok'}));
+    const d = await apiPost({action:'setSuppliers', data: JSON.stringify(suppliers)});
     if (d.status === 'error') { setSyncPill('err','⚠ Поставщики не сохранились'); return; }
     suppliersDirty = false; // сервер подтвердил
     setSyncPill('ok','✓ Поставщики сохранены');
@@ -2259,8 +2300,7 @@ async function applySnapshotToForm(id) {
   let d = snapshotCache[id];
   if (!d) {
     try {
-      const r = await fetch(SCRIPT_URL + '?action=snapshot&id=' + encodeURIComponent(id));
-      d = await r.json();
+      d = await jsonp({action:'snapshot', id: id});
       if (d.status === 'ok') snapshotCache[id] = d;
     } catch(e) {}
   }
@@ -2328,8 +2368,7 @@ async function loadTeam() {
   }
   wrap.innerHTML = '<div class="hist-empty">Загрузка...</div>';
   try {
-    const r = await fetch(SCRIPT_URL + '?action=getTeam&pin=' + encodeURIComponent(currentPin));
-    const d = await r.json();
+    const d = await jsonp({action:'getTeam', pin: currentPin});
     if (d.status === 'forbidden') {
       wrap.innerHTML = '<div class="hist-empty">' + (d.message || 'Нет доступа') + '</div>';
       return;
@@ -2444,12 +2483,7 @@ async function saveTeam() {
   teamMsg('Сохраняю...');
   setSyncPill('busy','👥 Сохраняю команду...');
   try {
-    const r = await fetch(SCRIPT_URL, {
-      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body: 'action=setTeam&pin=' + encodeURIComponent(currentPin) +
-            '&data=' + encodeURIComponent(JSON.stringify(teamDraft))
-    });
-    const d = await r.json();
+    const d = await apiPost({action:'setTeam', pin: currentPin, data: JSON.stringify(teamDraft)});
     if (d.status === 'ok') {
       teamMsg('Сохранено: ' + d.saved + ' чел.');
       setSyncPill('ok','✓ Команда сохранена');
